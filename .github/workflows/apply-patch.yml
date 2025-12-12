@@ -1,0 +1,88 @@
+name: Apply Patch (manual)
+
+on:
+  workflow_dispatch:
+    inputs:
+      branch_name:
+        description: 'Branch to create (e.g. feature/production-setup)'
+        required: true
+        default: 'feature/production-setup'
+      pr_title:
+        description: 'Pull request title'
+        required: true
+        default: 'chore: apply patch'
+      pr_body:
+        description: 'Pull request body'
+        required: false
+        default: ''
+      patch_content:
+        description: 'Raw patch/diff or tar content (paste the diff or tar contents directly)'
+        required: true
+
+jobs:
+  apply-patch:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout default branch
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install git & jq
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y git jq
+
+      - name: Prepare patch file
+        run: |
+          mkdir -p /tmp/patchapply
+          printf "%s" "${{ inputs.patch_content }}" > /tmp/patchapply/patch_input
+
+      - name: Apply patch (git am / git apply / tar)
+        run: |
+          set -e
+          cd $GITHUB_WORKSPACE
+          BRANCH="${{ inputs.branch_name }}"
+          git config user.name "automation"
+          git config user.email "automation@example.com"
+
+          # Create branch
+          git checkout -b "$BRANCH"
+
+          # Try git am (patch series)
+          if git am --3way --whitespace=fix /tmp/patchapply/patch_input 2>/dev/null; then
+            echo "Applied patch via git am"
+          else
+            # If it's a tar, extract to workspace
+            if tar -tf /tmp/patchapply/patch_input >/dev/null 2>&1; then
+              tar -xvf /tmp/patchapply/patch_input -C $GITHUB_WORKSPACE
+              git add -A
+              git commit -m "${{ inputs.pr_title }}" || echo "No changes to commit"
+            else
+              # Try git apply
+              if git apply /tmp/patchapply/patch_input >/dev/null 2>&1; then
+                git add -A
+                git commit -m "${{ inputs.pr_title }}" || echo "No changes to commit"
+              else
+                echo "Failed to apply patch: input not recognized as git patch/diff or tarball"
+                exit 1
+              fi
+            fi
+          fi
+
+          # Push using GITHUB_TOKEN (the runner injects it)
+          git push origin "$BRANCH"
+
+      - name: Create PR via GitHub API
+        env:
+          GITHUB_TOKEN_FOR_API: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          API_URL="https://api.github.com/repos/${{ github.repository }}/pulls"
+          BODY=$(jq -n \
+            --arg title "${{ inputs.pr_title }}" \
+            --arg head "${{ inputs.branch_name }}" \
+            --arg base "${{ github.ref_name }}" \
+            --arg body "${{ inputs.pr_body }}" \
+            '{title:$title, head:$head, base:$base, body:$body}')
+          response=$(curl -s -X POST -H "Authorization: token ${GITHUB_TOKEN_FOR_API}" -H "Accept: application/vnd.github+json" "$API_URL" -d "$BODY")
+          echo "$response" | jq .
